@@ -1,3 +1,4 @@
+from math import log
 from flask import Blueprint, jsonify, request, Response
 import asyncio
 import json
@@ -109,7 +110,7 @@ def analyze_url():
         
         # 运行异步分析函数
         analysis_result = asyncio.run(analyze_music_url(url))
-        
+        logger.warning(f"Analysis result: {analysis_result}")
         if not analysis_result:
             return jsonify({'error': 'Failed to analyze URL'}), 500
         

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import json
 from typing import List, Optional, Callable, Any
 from playwright.async_api import async_playwright, BrowserContext, Page, Response
 
@@ -114,8 +115,8 @@ async def fetch_page(
         await page.goto(url, wait_until="load")
         
         # 页面加载完成后再获取元素内容
-        song_name = None
-        artist_name = None
+        song_name = ""
+        artist_name = ""
         try:
             # 使用timeout参数避免无限等待
             song_name = await page.text_content("#m-songInfo-song-name-text", timeout=5000)
@@ -141,6 +142,84 @@ async def fetch_page(
         # 确保页面被释放
         await pool.release(page)
 
+async def check_login(page: Page) -> bool:
+    """检查页面是否已登录（通过检查关键cookie）"""
+    try:
+        # 获取当前页面的所有cookie
+        cookies = await page.context.cookies()
+        
+        # 检查是否存在登录状态的关键cookie
+        # 通过对比login.cookie和logout.cookie，发现登录状态特有cookie是MUSIC_U和__csrf
+        login_cookie_names = ['MUSIC_U', '__csrf']
+        found_cookies = []
+        
+        for cookie in cookies:
+            if cookie['name'] in login_cookie_names:
+                found_cookies.append(cookie['name'])
+        
+        if found_cookies:
+            logger.info(f"检测到登录关键cookie: {', '.join(found_cookies)}")
+            return True
+        
+        logger.info("未检测到登录关键cookie，用户未登录")
+        return False
+    except Exception as e:
+        logger.error(f"检查登录状态失败: {e}")
+        return False
+
+async def wait_for_login(page: Page, timeout: int = 120) -> bool:
+    """
+    等待用户扫码登录（通过检查cookie）
+    
+    Args:
+        page: Playwright页面实例
+        timeout: 等待超时时间（秒）
+        
+    Returns:
+        bool: 登录成功返回True，超时返回False
+    """
+    try:
+        logger.info("等待扫码登录...")
+        
+        # 定期检查cookie，判断是否登录成功
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if await check_login(page):
+                logger.info("登录成功!")
+                return True
+            # 等待1秒后再次检查
+            await asyncio.sleep(1)
+        
+        logger.error("登录超时!")
+        return False
+    except Exception as e:
+        logger.error(f"登录过程中出错: {e}")
+        return False
+
+def load_cookies_from_file(file_path: str) -> List[dict]:
+    """从文件加载cookie并转换格式以符合Playwright要求"""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            cookies = json.load(f)
+        
+        # 转换cookie格式，确保sameSite值符合Playwright要求
+        # Playwright只接受"Strict"、"Lax"或"None"
+        for cookie in cookies:
+            # 移除不需要的字段
+            for field in ['storeId']:
+                if field in cookie:
+                    del cookie[field]
+            
+            # 处理sameSite值
+            if 'sameSite' in cookie and cookie['sameSite'] not in ['Strict', 'Lax', 'None']:
+                cookie['sameSite'] = 'Lax'  # 默认使用Lax
+        
+        logger.info(f"成功从{file_path}加载并转换{len(cookies)}个cookie")
+        return cookies
+    except Exception as e:
+        logger.error(f"加载cookie文件失败: {e}")
+        return []
+
 async def analyze_music_url(url: str) -> Optional[dict]:
     """
     分析音乐URL，提取音乐信息和分析数据
@@ -152,21 +231,46 @@ async def analyze_music_url(url: str) -> Optional[dict]:
         Optional[dict]: 音乐分析结果，如果出错则返回None
     """
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        iphone = pw.devices["iPhone 13"]
-        context = await browser.new_context(**iphone)
+        browser = await pw.chromium.launch(headless=False)
+        # 使用默认的web浏览模式
+        phone = pw.devices["iPhone 14 Pro"]
+        context = await browser.new_context(**phone)
+        
+        # 尝试加载本地登录cookie
+        login_cookie_path = '/Users/yqf/Desktop/codes/music_analysis/app/pkg/login.cookie'
+        login_cookies = load_cookies_from_file(login_cookie_path)
+        if login_cookies:
+            await context.add_cookies(login_cookies)
+            logger.info("已将本地登录cookie添加到浏览器上下文")
 
         pool = PagePool(max_pages=1)
-
-        # 定义过滤条件：只接收含 ".mp3" 的请求
-        def filter_func(resp: Response) -> bool:
-            return ".mp3" in resp.url
-
+        
+        # 先获取一个页面用于登录检查
+        page = await pool.get_page(context)
+        
         try:
+            # 打开登录页面检查登录状态
+            login_url = "https://music.163.com/"
+            await page.goto(login_url, wait_until="load")
+            # 检查是否已登录
+            if not await check_login(page):
+                logger.warning("未登录，需要扫码登录")
+                return None
+            else:
+                logger.info("已登录，继续操作")
+            
+            # 释放页面回页面池
+            await pool.release(page)
+            
+            # 定义过滤条件：只接收含 ".mp3" 的请求
+            def filter_func(resp: Response) -> bool:
+                print(resp.url)
+                return ".mp3" in resp.url or ".m4a" in resp.url
+
             # 获取MP3 URL
             data = await fetch_page(pool, context, url, filter_func, timeout=10)
             
-            if not data.get("mp3_url"):
+            if not data or not data.get("mp3_url"):
                 logger.error("未找到MP3 URL")
                 return None
             
@@ -185,39 +289,20 @@ async def analyze_music_url(url: str) -> Optional[dict]:
 
 async def main():
     """主函数示例"""
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=False)
-        iphone = pw.devices["iPhone 13"]
-        context = await browser.new_context(**iphone)
-
-        pool = PagePool(max_pages=3)  # 示例：使用3个页面的池
-
-        urls = [
-            "https://music.163.com/#/song?id=233888",
-        ]
-
-        # 定义过滤条件：只接收含 ".mp3" 的请求
-        def filter_func(resp: Response) -> bool:
-            return ".mp3" in resp.url
-
-        tasks = [
-            fetch_page(pool, context, url, filter_func, timeout=10)
-            for url in urls
-        ]
-
-        results = await asyncio.gather(*tasks)
-
-        for i, result in enumerate(results):
-            print(f"\n=== 任务 {i+1} 返回 ===")
-            if result:
-                print(f"歌曲名: {result.get('song_name')}")
-                print(f"艺术家: {result.get('artist_name')}")
-                print(f"MP3 URL: {result.get('mp3_url', '')[:200]}...")
-            else:
-                print("未获取到有效结果")
-
-        await pool.close_all()
-        await browser.close()
+    # 测试完整的音乐URL分析流程（包括登录检查）
+    url = "https://music.163.com/#/song?id=372359"
+    print(f"\n=== 测试完整音乐URL分析流程 ===")
+    print(f"分析URL: {url}")
+    
+    result = await analyze_music_url(url)
+    
+    print(f"\n=== 分析结果 ===")
+    if result:
+        print(f"歌曲名: {result.get('song_name')}")
+        print(f"艺术家: {result.get('artist_name')}")
+        print(f"MP3 URL: {result.get('mp3_url', '')[:200]}...")
+    else:
+        print("未获取到有效结果")
 
 if __name__ == "__main__":
     asyncio.run(main())
